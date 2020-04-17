@@ -2558,19 +2558,38 @@ class DNDarray:
 
         # entirely new split axis, need to redistribute
         else:
-            _, output_shape, _ = self.comm.chunk(self.shape, axis)
+            rank = self.comm.rank
+            size = self.comm.size
+            _, output_shape, output_slices = self.comm.chunk(self.gshape, split=axis)
+            _, _, current_local_slices = self.comm.chunk(self.gshape, split=self.split)
             redistributed = torch.empty(
                 output_shape, dtype=self.dtype.torch_type(), device=self.device.torch_device
             )
-
-            send_counts, send_displs, _ = self.comm.counts_displs_shape(self.lshape, axis)
-            recv_counts, recv_displs, _ = self.comm.counts_displs_shape(self.shape, self.split)
-            self.comm.Alltoallv(
-                (self.__array, send_counts, send_displs),
-                (redistributed, recv_counts, recv_displs),
-                send_axis=axis,
-                recv_axis=self.split,
+            ur_slice = self.numdims * (slice(None, None, None),)
+            put_slice = (
+                ur_slice[: self.split]
+                + (current_local_slices[self.split],)
+                + ur_slice[self.split + 1 :]
             )
+            fetch_slice = ur_slice[:axis] + (output_slices[axis],) + ur_slice[axis + 1 :]
+            redistributed[put_slice] = self._DNDarray__array[fetch_slice]
+            for i in range(size):
+                if i != rank:
+                    dest_remote_slices = self.comm.chunk(self.gshape, split=axis, rank=i)[2]
+                    fetch_slice = (
+                        ur_slice[:axis] + (dest_remote_slices[axis],) + ur_slice[axis + 1 :]
+                    )
+                    data = self._DNDarray__array[fetch_slice]
+                    self.comm.send(data, dest=i)
+                    current_remote_slices = self.comm.chunk(self.gshape, split=self.split, rank=i)[
+                        2
+                    ]
+                    put_slice = (
+                        ur_slice[: self.split]
+                        + (current_remote_slices[self.split],)
+                        + ur_slice[self.split + 1 :]
+                    )
+                    redistributed[put_slice] = self.comm.recv(source=i)
 
             self.__array = redistributed
             self.__split = axis
