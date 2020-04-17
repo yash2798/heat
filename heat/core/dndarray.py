@@ -2575,15 +2575,15 @@ class DNDarray:
             redistributed[put_slice] = self._DNDarray__array[fetch_slice]
             for i in range(size):
                 if i != rank:
-                    dest_remote_slices = self.comm.chunk(self.gshape, split=axis, rank=i)[2]
+                    _, _, dest_remote_slices = self.comm.chunk(self.gshape, split=axis, rank=i)
                     fetch_slice = (
                         ur_slice[:axis] + (dest_remote_slices[axis],) + ur_slice[axis + 1 :]
                     )
                     data = self._DNDarray__array[fetch_slice]
                     self.comm.send(data, dest=i)
-                    current_remote_slices = self.comm.chunk(self.gshape, split=self.split, rank=i)[
-                        2
-                    ]
+                    _, _, current_remote_slices = self.comm.chunk(
+                        self.gshape, split=self.split, rank=i
+                    )
                     put_slice = (
                         ur_slice[: self.split]
                         + (current_remote_slices[self.split],)
