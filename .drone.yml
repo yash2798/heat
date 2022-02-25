@@ -7,7 +7,7 @@ steps:
   image: ghcr.io/helmholtz-analytics/heat:1.1.1-alpha
   commands:
     - pip install pytest
-    - mpirun -n 4 pytest heat/
+    - pytest heat/
 
 trigger:
     branch:
