@@ -7,7 +7,7 @@ steps:
   image: ghcr.io/helmholtz-analytics/heat:1.1.1-alpha
   commands:
     - pip install pytest
-    - pytest heat/
+    - python -c "import heat; print(ht.ones((3,3))"
 
 trigger:
     branch:
