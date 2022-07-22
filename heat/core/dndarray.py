@@ -1271,6 +1271,22 @@ class DNDarray:
         if axis == self.split:
             return self
         if axis is None:
+            axes = list(range(self.ndim))
+            if self.split != 0:
+                # operate on axis 0                                                                                                                           
+                axes[0], axes[self.split] = self.split, 0
+                self = linalg.transpose(self, axes)
+            gathered = torch.empty(
+                self.shape, dtype=self.dtype.torch_type(), device=self.device.torch_device
+            )
+            counts, displs = self.counts_displs()
+            self.comm.Allgatherv(self.__array, (gathered, counts, displs), recv_axis=self.split)
+            self.__array = gathered
+            self.__split = axis
+            self.__lshape_map = None
+            if axes != list(range(self.ndim)):
+                # transpose back                                                                                                                              
+                self = linalg.transpose(self, axes)
             gathered = torch.empty(
                 self.shape, dtype=self.dtype.torch_type(), device=self.device.torch_device
             )
