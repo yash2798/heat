@@ -136,8 +136,10 @@ class TestCase(unittest.TestCase):
             "Local shapes do not match. "
             "Got {} expected {}".format(heat_array.lshape, expected_array[slices].shape),
         )
-        local_heat_numpy = heat_array.numpy()
-        self.assertTrue(np.allclose(local_heat_numpy, expected_array))
+        local_heat_numpy = heat_array.larray.cpu().numpy()
+        local_test = np.allclose(local_heat_numpy, expected_array[slices])
+        test_result = self._comm.allreduce(local_test, MPI.LAND)
+        self.assertTrue(test_result)
 
     def assert_func_equal(
         self,
