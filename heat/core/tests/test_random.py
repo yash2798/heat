@@ -43,8 +43,7 @@ class TestRandom(TestCase):
 
     def test_permutation(self):
         # Reset RNG
-        ht.random.seed()
-        state = torch.random.get_rng_state()
+        ht.random.seed(torch.initial_seed())
 
         # results
         a = ht.random.permutation(10)
@@ -58,7 +57,7 @@ class TestRandom(TestCase):
         c0 = ht.random.permutation(ht.resplit(c_arr, 0))
         c1 = ht.random.permutation(ht.resplit(c_arr, 1))
 
-        torch.set_rng_state(state)
+        torch.manual_seed(torch.initial_seed())
 
         # torch results to compare to
         a_cmp = torch.randperm(a.shape[0], device=self.device.torch_device)
@@ -399,7 +398,7 @@ class TestRandom(TestCase):
         self.assertFalse(np.allclose(b, c))
 
     def test_randperm(self):
-        state = torch.random.get_rng_state()
+        torch.manual_seed(torch.initial_seed())
 
         # results
         a = ht.random.randperm(10, dtype=ht.int32)
@@ -407,7 +406,7 @@ class TestRandom(TestCase):
         c = ht.random.randperm(5, split=0)
         d = ht.random.randperm(5, dtype=ht.float64)
 
-        torch.random.set_rng_state(state)
+        torch.manual_seed(torch.initial_seed())
 
         # torch results to compare to
         a_cmp = torch.randperm(10, dtype=torch.int32, device=self.device.torch_device)
