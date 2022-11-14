@@ -15,10 +15,9 @@ from ..indexing import where
 from ..random import randn
 
 from ..manipulations import vstack, hstack, diag, balance
-from ..exponential import sqrt
 
 from .. import statistics
-from math import log, ceil, floor
+from math import log, ceil, floor, sqrt
 
 
 __all__ = ["hsvd"]
@@ -26,9 +25,9 @@ __all__ = ["hsvd"]
 
 def hsvd(
     A: DNDarray,
-    maxrank: int = 0,
-    maxmergedim: int = 0,
-    loctol: float = 5e-2,
+    maxrank: int = None,
+    maxmergedim: int = None,
+    reltol: float = None,
     full: bool = False,
     silent: bool = True,
 ) -> Tuple[DNDarray, DNDarray, DNDarray]:
@@ -41,14 +40,13 @@ def hsvd(
     INPUT:
     A:          two-dimensional DNDarray; the matrix of which the approximate truncated SVD has to be computed
     maxrank:    integer; rank to which SVD is truncated.
-    loctol:     ---currently not supported---
+    reltol:     tolerance for the relative error ||A-U Sigma V^T ||_F / ||A||_F (computed according to [2] for the "worst-case" of merging along a binary tree)
     full:       boolean; True: compute U[:,:maxrank], sigma[:maxrank], V[:,:maxrank], False: Compute only U (i.e. the raxrank leading left singular vectors)
     silent:     boolean; True: no information on the computational procedure is displayed, False: information is printed.
 
     OUTPUT:
     either U (if full=False) or U, sigma, V (if full=True); all of them as DNDarrays.
-
-    input "loctol" is currently not supported. TODO: implement error control with local tolerance (instead of truncation rank) as in [2]...
+    Moreover, an upper estimate (rel_error_estimate) for ||A-U Sigma V^T ||_F / ||A||_F (computed according to [2] along the "true" merging tree) is returned.
 
     Selected References:
     [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
@@ -80,9 +78,9 @@ def hsvd(
 
     # if maxrank = 0 we choose a default value for maxrank
     # the chosen default value corresponds to merging along a binary tree (i.e. maxrank = local size / 2)
-    if maxrank == 0:
+    if maxrank is None:
         maxrank = floor(max(A.lshape_map[:, 1]) / 2)
-    if maxmergedim == 0:
+    if maxmergedim is None:
         maxmergedim = max(A.lshape_map[:, 1])
     # if the manually set maxrank is so large that with either the default or the manually set maxmergedim it would not be possible to merge (even along a binary tree), we increase maxmergedim and warn the user
     if 2 * maxrank > maxmergedim:
@@ -91,6 +89,10 @@ def hsvd(
             print("WARNING: maxmergedim = 2*truncationrank +1 might cause memory issues!")
 
     no_procs = A.comm.Get_size()
+    Anorm = vector_norm(A)
+
+    if reltol is not None:
+        loctol = Anorm.larray * reltol / sqrt(2 * no_procs - 1)
 
     # compute the SVDs on the 0th level
     level = 0
@@ -99,12 +101,25 @@ def hsvd(
         print("hSVD level %d..." % level, active_nodes)
     U_loc, sigma_loc, _ = torch.linalg.svd(A.larray, full_matrices=False)
 
-    # truncation of the SVD at each "node"
-    # *************************************************************************
-    # !!! TODO:  implement adaptive truncation
-    # *************************************************************************
-    loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
+    if reltol is None:
+        loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
+    else:
+        ideal_trunc_rank = min(
+            torch.argwhere(
+                torch.tensor(
+                    [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
+                )
+                < loctol**2
+            )
+        )
+        loc_trunc_rank = min(maxrank, ideal_trunc_rank)
+        if loc_trunc_rank != ideal_trunc_rank:
+            print(
+                "Warning (level %d, process %d): reltol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
+                % (level, A.comm.rank, reltol, ideal_trunc_rank, maxrank)
+            )
     U_loc = torch.linalg.matmul(U_loc[:, :loc_trunc_rank], torch.diag(sigma_loc[:loc_trunc_rank]))
+    err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
 
     # if not silent:
     #    graph = np.ones(no_procs)
@@ -147,6 +162,9 @@ def hsvd(
         if A.comm.rank in future_nodes:
             # FUTURE NODES
             # in the future nodes receive local arrays from previous level
+            err_squared_loc = [err_squared_loc] + [
+                torch.zeros_like(err_squared_loc) for i in recv_from[A.comm.rank]
+            ]
             U_loc = [U_loc] + [
                 torch.zeros(
                     (A.shape[0], dims_global[i]), dtype=A.larray.dtype, device=A.device.torch_device
@@ -155,17 +173,37 @@ def hsvd(
             ]
             for k in range(len(recv_from[A.comm.rank])):
                 A.comm.Recv(U_loc[k + 1], recv_from[A.comm.rank][k], tag=recv_from[A.comm.rank][k])
+                A.comm.Recv(
+                    err_squared_loc[k + 1],
+                    recv_from[A.comm.rank][k],
+                    tag=2 * no_procs + recv_from[A.comm.rank][k],
+                )
             # concatenate the received arrays
             U_loc = torch.hstack(U_loc)
+            err_squared_loc = sum(err_squared_loc)
             level += 1
             if A.comm.rank == 0 and not silent:
                 print("hSVD level %d..." % level, "reduce to nodes", future_nodes)
             # compute "local" SVDs on the current level
             U_loc, sigma_loc, _ = torch.linalg.svd(U_loc, full_matrices=False)
-            loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
-            # *****************************************************************
-            # TODO: implement truncation
-            # *****************************************************************
+            if reltol is None:
+                loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
+            else:
+                ideal_trunc_rank = min(
+                    torch.argwhere(
+                        torch.tensor(
+                            [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
+                        )
+                        < loctol**2
+                    )
+                )
+                loc_trunc_rank = min(maxrank, ideal_trunc_rank)
+                if loc_trunc_rank != ideal_trunc_rank:
+                    print(
+                        "Warning (level %d, process %d): reltol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
+                        % (level, A.comm.rank, reltol, ideal_trunc_rank, maxrank)
+                    )
+
             if len(future_nodes) > 1:
                 # prepare next level or...
                 U_loc = torch.linalg.matmul(
@@ -174,10 +212,12 @@ def hsvd(
             else:
                 # or do only truncate in case of the final level
                 U_loc = U_loc[:, :loc_trunc_rank]
+            err_squared_loc += torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
         elif A.comm.rank in active_nodes and A.comm.rank not in future_nodes:
             # NOT FUTURE NODES
             # in these nodes we only send the local arrays to the respective future node
             A.comm.Send(U_loc, send_to[A.comm.rank], tag=A.comm.rank)
+            A.comm.Send(err_squared_loc, send_to[A.comm.rank], tag=2 * no_procs + A.comm.rank)
 
         if len(future_nodes) == 1:
             finished = True
@@ -190,8 +230,14 @@ def hsvd(
         U_loc = torch.zeros(U_loc_shape, dtype=A.larray.dtype, device=A.device.torch_device)
     req = A.comm.Ibcast(U_loc, root=0)
     req.Wait()
+    req = A.comm.Ibcast(err_squared_loc, root=0)
+    req.Wait()
 
     U = factories.array(U_loc, device=A.device, split=None, comm=A.comm)
+
+    rel_error_estimate = (
+        factories.array(err_squared_loc**0.5, device=A.device, split=None, comm=A.comm) / Anorm
+    )
 
     # if not silent:
     #    np.savetxt('hsvd_graph.txt',graph)
@@ -205,11 +251,11 @@ def hsvd(
         V = matmul(V, diag(1 / sigma))
 
         if transposeflag and full:
-            return V, sigma, U
+            return V, sigma, U, rel_error_estimate
         elif transposeflag and not full:
-            return V
+            return V, rel_error_estimate
         else:
-            return U, sigma, V
-        return U
+            return U, sigma, V, rel_error_estimate
+        return U, rel_error_estimate
 
-    return U
+    return U, rel_error_estimate
