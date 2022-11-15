@@ -1,5 +1,5 @@
 test:
-  image: ghcr.io/helmholtz-analytics/heat:1.2.0-dev_torch1.12_cuda11.7_py3.8
+  image: nvcr.io/nvidia/pytorch:22.05-py3
   tags:
     - cuda
     - x86_64
@@ -8,6 +8,7 @@ test:
     - apt -y install build-essential python3-pip curl git
     - DEBIAN_FRONTEND=noninteractive apt -y install libhdf5-openmpi-dev libpnetcdf-dev
     - pip install pytest coverage
+    - pip install .[hdf5,netcdf]
     - COVERAGE_FILE=report/cov/coverage1 HEAT_TEST_USE_DEVICE=cpu mpirun --allow-run-as-root -n 1 coverage run --source=heat --parallel-mode -m pytest --junitxml=report/test/report1.xml heat/
     - COVERAGE_FILE=report/cov/coverage2 HEAT_TEST_USE_DEVICE=gpu mpirun --allow-run-as-root -n 3 coverage run --source=heat --parallel-mode -m pytest --junitxml=report/test/report3.xml heat/
     - COVERAGE_FILE=report/cov/coverage5 HEAT_TEST_USE_DEVICE=cpu mpirun --allow-run-as-root -n 5 coverage run --source=heat --parallel-mode -m pytest --junitxml=report/test/report5.xml heat/
