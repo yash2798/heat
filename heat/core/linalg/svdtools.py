@@ -454,7 +454,8 @@ def compute_local_truncated_svd(
         ideal_trunc_rank = min(
             torch.argwhere(
                 torch.tensor(
-                    [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
+                    [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)],
+                    device=U_loc.device,
                 )
                 < loctol**2
             )
@@ -489,7 +490,8 @@ def compute_local_pod(
             ideal_trunc_rank = min(
                 torch.argwhere(
                     torch.tensor(
-                        [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
+                        [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)],
+                        device=U_loc.device,
                     )
                     < loctol**2
                 )
@@ -531,7 +533,9 @@ def compute_local_pod(
             # )
             ideal_trunc_rank = min(
                 torch.argwhere(
-                    torch.tensor([torch.sum(lamda[k:]) for k in range(lamda.shape[0])])
+                    torch.tensor(
+                        [torch.sum(lamda[k:]) for k in range(lamda.shape[0])], device=U_loc.device
+                    )
                     < loctol**2
                 )
             )
