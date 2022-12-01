@@ -28,6 +28,8 @@ def hsvd(
     maxrank: Union[int, None] = None,
     maxmergedim: Union[int, None] = None,
     reltol: Union[float, None] = None,
+    safetyshift: int = 0,
+    no_of_merges: Union[int, None] = None,
     full: bool = False,
     silent: bool = True,
 ) -> Union[
@@ -45,6 +47,7 @@ def hsvd(
     reltol:     tolerance for the relative error ||A-U Sigma V^T ||_F / ||A||_F (computed according to [2] for the "worst-case" of merging along a binary tree)
     full:       boolean; True: compute U[:,:maxrank], sigma[:maxrank], V[:,:maxrank], False: Compute only U (i.e. the raxrank leading left singular vectors)
     silent:     boolean; True: no information on the computational procedure is displayed, False: information is printed.
+    safetyshift:    increases the truncation rank by adding a safety shift.
 
     OUTPUT:
     either U (if full=False) or U, sigma, V (if full=True); all of them as DNDarrays.
@@ -78,19 +81,10 @@ def hsvd(
         transposeflag = True
         A = A.T
 
-    # if maxrank = 0 we choose a default value for maxrank
-    # the chosen default value corresponds to merging along a binary tree (i.e. maxrank = local size / 2)
-    if maxrank is None:
-        maxrank = floor(max(A.lshape_map[:, 1]) / 2)
-    if maxmergedim is None:
-        maxmergedim = max(A.lshape_map[:, 1])
-    # if the manually set maxrank is so large that with either the default or the manually set maxmergedim it would not be possible to merge (even along a binary tree), we increase maxmergedim and warn the user
-    if 2 * maxrank > maxmergedim:
-        maxmergedim = 2 * maxrank + 1
-        if A.comm.rank == 0:
-            print("WARNING: maxmergedim = 2*truncationrank +1 might cause memory issues!")
-
+    # Choice of the parameters
+    # A_local_size = max(A.lshape_map[:, 1])
     no_procs = A.comm.Get_size()
+
     Anorm = vector_norm(A)
 
     if reltol is not None:
@@ -126,7 +120,7 @@ def hsvd(
     # err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
 
     U_loc, sigma_loc, err_squared_loc = compute_local_truncated_svd(
-        level, A.comm.rank, A.larray, maxrank, loctol
+        level, A.comm.rank, A.larray, maxrank, loctol, safetyshift
     )
     U_loc = torch.linalg.matmul(U_loc, torch.diag(sigma_loc))
 
@@ -148,16 +142,19 @@ def hsvd(
         current_future_node = 0
         used_budget = 0
         k = 0
+        counter = 0
         while k < len(active_nodes):
             current_idx = active_nodes[k]
-            if used_budget + dims_global[current_idx] > maxmergedim:
+            if used_budget + dims_global[current_idx] > maxmergedim or counter == no_of_merges:
                 current_future_node = current_idx
                 future_nodes.append(current_future_node)
                 used_budget = dims_global[current_idx]
+                counter = 1
             else:
                 if not used_budget == 0:
                     send_to[current_idx] = current_future_node
                 used_budget += dims_global[current_idx]
+                counter += 1
             k += 1
 
         recv_from = [[]] * no_procs
@@ -195,8 +192,10 @@ def hsvd(
                 print("hSVD level %d..." % level, "reduce to nodes", future_nodes)
             # compute "local" SVDs on the current level
 
+            if len(future_nodes) == 1:
+                safetyshift = 0
             U_loc, sigma_loc, err_squared_loc_new = compute_local_truncated_svd(
-                level, A.comm.rank, U_loc, maxrank, loctol
+                level, A.comm.rank, U_loc, maxrank, loctol, safetyshift
             )
 
             # U_loc, sigma_loc, _ = torch.linalg.svd(U_loc, full_matrices=False)
@@ -441,15 +440,27 @@ def hpod(
 
 
 def compute_local_truncated_svd(
-    level: int, proc_id: int, U_loc: torch.Tensor, maxrank: int, loctol: Union[float, None]
+    level: int,
+    proc_id: int,
+    U_loc: torch.Tensor,
+    maxrank: int,
+    loctol: Union[float, None],
+    safetyshift: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """
     Auxiliary routine for hsvd: computes the truncated SVD of the respective local array
     """
     U_loc, sigma_loc, _ = torch.linalg.svd(U_loc, full_matrices=False)
 
+    if U_loc.dtype == torch.float64:
+        noiselevel = 1e-14
+    elif U_loc.dtype == torch.float32:
+        noiselevel = 1e-7
+
+    cut_noise_rank = max(torch.argwhere(sigma_loc >= noiselevel)) + 1
+
     if loctol is None:
-        loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
+        loc_trunc_rank = min(maxrank, cut_noise_rank)
     else:
         ideal_trunc_rank = min(
             torch.argwhere(
@@ -460,13 +471,15 @@ def compute_local_truncated_svd(
                 < loctol**2
             )
         )
-        loc_trunc_rank = min(maxrank, ideal_trunc_rank)
+        loc_trunc_rank = min(maxrank, ideal_trunc_rank, cut_noise_rank)
         if loc_trunc_rank != ideal_trunc_rank:
             print(
                 "Warning (level %d, process %d): abs tol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
                 % (level, proc_id, loctol, ideal_trunc_rank, maxrank)
             )
-    err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
+
+    loc_trunc_rank = min(sigma_loc.shape[0], loc_trunc_rank + safetyshift)
+    err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank - safetyshift :]) ** 2
     return U_loc[:, :loc_trunc_rank], sigma_loc[:loc_trunc_rank], err_squared_loc
 
 
