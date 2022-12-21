@@ -20,7 +20,377 @@ from .. import statistics
 from math import log, ceil, floor, sqrt
 
 
-__all__ = ["hsvd", "hpod"]
+__all__ = [
+    "hsvd_rank",
+    "hsvd_reltol",
+    "hpod_rank",
+    "hpod_reltol",
+    "hsvd",
+    "hpod",
+    "vector_norm_weighted",
+]
+
+
+#########################################################################################
+# user-friendly versions of hSVD and hPOD
+#########################################################################################
+
+
+def hsvd_rank(
+    A: DNDarray,
+    maxrank: int,
+    maxmergedim: Union[int, None] = None,
+    safetyshift: int = 5,
+    full: bool = False,
+    silent: bool = True,
+) -> Union[
+    Tuple[DNDarray, DNDarray, DNDarray, float], Tuple[DNDarray, DNDarray, DNDarray], DNDarray
+]:
+    """
+    Hierarchical SVD (hSVD) with prescribed truncation rank maxrank.
+    If A = U diag(sigma) V^T is the true SVD of A, this routine computes an approximation for U[:,:maxrank] (and sigma[:maxrank], V[:,:maxrank])
+
+    The accuracy of this approximation depends on the structure of A ("low-rank") and appropriate choice of parameters.
+
+    Parameters
+    ----------
+    A : DNDarray
+        array of which the hSVD has to be computed.
+    maxrank : int
+        truncation rank.
+    full : bool, optional
+        full=True implies that also Sigma and V are computed and returned. The default is False.
+
+    'Expert' parameters
+    ----------
+
+    maxmergedim : Union[int, None], optional
+        maximal size of the concatenation matrices during the merging procedure. The default is None and results in an appropriate choice depending on A and maxrank.
+    safetyshift : int, optional
+        Increases the actual truncation rank within the computations by a safety shift. The default is 5.
+    silent : bool, optional
+        silent=False implies that some information on the computations are printed. The default is True.
+
+    Returns
+    -------
+    (Union[    Tuple[DNDarray, DNDarray, DNDarray, float], Tuple[DNDarray, DNDarray, DNDarray], DNDarray])
+        if full=True: U, Sigma, V, a-posteriori error estimate for the reconstruction error ||A-U Sigma V^T ||_F / ||A||_F (computed according to [2] along the "true" merging tree).
+        if full=False: U, a-posteriori error estimate
+
+    References
+    -------
+    [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
+    [2] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
+    """
+    if A.comm.rank == 0:
+        print(
+            "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed trunction rank maxrank only yields accurate results when the underlying matrix is of low-rank structure with rank at most maxrank."
+        )
+    A_local_size = max(A.lshape_map[:, 1])
+
+    if maxmergedim is not None and maxmergedim < 2 * (maxrank + safetyshift) + 1:
+        if A.comm.rank == 0:
+            raise RuntimeError(
+                "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
+                % (maxrank, maxmergedim)
+            )
+
+    if maxmergedim is None:
+        if A_local_size >= 2 * (maxrank + safetyshift):
+            maxmergedim = A_local_size
+        else:
+            maxmergedim = 2 * (maxrank + safetyshift) + 1
+            if A.comm.rank == 0:
+                print(
+                    "Warning: Given maxrank (or saftyshift) is so large that arrays of size larger than A.larray have to be dealt with on a single process. This may cause memory issues."
+                )
+
+    return hsvd(
+        A,
+        maxrank=maxrank,
+        maxmergedim=maxmergedim,
+        reltol=None,
+        safetyshift=safetyshift,
+        no_of_merges=None,
+        full=full,
+        silent=silent,
+        warnings_off=True,
+    )
+
+
+def hsvd_reltol(
+    A: DNDarray,
+    reltol: float,
+    maxrank: Union[int, None] = None,
+    maxmergedim: Union[int, None] = None,
+    safetyshift: int = 5,
+    no_of_merges: Union[int, None] = None,
+    full: bool = False,
+    silent: bool = True,
+) -> Union[
+    Tuple[DNDarray, DNDarray, DNDarray, float], Tuple[DNDarray, DNDarray, DNDarray], DNDarray
+]:
+    """
+    Hierchical SVD (hSVD) with prescribed upper bound on the relative reconstruction error.
+    If A = U diag(sigma) V^T is the true SVD of A, this routine computes an approximation for U[:,:r] (and sigma[:r], V[:,:r])
+    such that the rel. reconstruction error ||A-U[:,:r] diag(sigma[:r]) V[:,:r]^T ||_F / ||A||_F does not exceed reltol.
+
+    The accuracy of this approximation depends on the structure of A ("low-rank") and appropriate choice of parameters.
+
+    Parameters
+    ----------
+    A : DNDarray
+        array of which the hSVD has to be computed.
+    reltol : float
+        desired upper bound on the relative reconstruction error ||A-U Sigma V^T ||_F / ||A||_F. This upper bound is processed into 'local'
+        tolerances during the actual computations assuming the worst case scenario of a binary "merging tree"; therefore, the a-posteriori
+        error for the relative error using the true "merging tree" (see output) may be significantly smaller than reltol.
+        Prescription of maxrank or maxmergedim (disabled in default) can result in loss of desired precision, but can help to avoid memory issues.
+    full : bool, optional
+        full=True implies that also Sigma and V are computed and returned. The default is False.
+
+
+    'Expert' parameters
+    ------
+    no_of_merges : Union[int, None], optional
+        Maximum number of processes to be merged at each step. If no further arguments are provided (see below),
+        this completely determines the "merging tree" and may cause memory issues. The default is None and results in a binary merging tree.
+        Note that no_of_merges dominates maxrank and maxmergedim in the sense that at most no_of_merges processes are merged
+        even if maxrank and maxmergedim would allow merging more processes...
+
+    maxrank : Union[int, None], optional
+        maximal truncation rank. The default is None.
+        Setting at least one of maxrank and maxmergedim is recommended to avoid memory issues, but can result in loss of desired precision.
+        Setting only maxrank (and not maxmergedim) results in an appropriate default choice for maxmergedim.
+    maxmergedim : Union[int, None], optional
+        maximal size of the concatenation matrices during the merging procedure. The default is None and results in an appropriate choice depending on A and maxrank. The default is None.
+        Setting at least one of maxrank and maxmergedim is recommended to avoid memory issues, but can result in loss of desired precision.
+        Setting only maxmergedim (and not maxrank) results in an appropriate default choice for maxrank.
+
+    safetyshift : int, optional
+        Increases the actual truncation rank within the computations by a safety shift. The default is 5.
+
+    silent : bool, optional
+        silent=False implies that some information on the computations are printed. The default is True.
+
+    Returns
+    -------
+    (Union[    Tuple[DNDarray, DNDarray, DNDarray, float], Tuple[DNDarray, DNDarray, DNDarray], DNDarray])
+        if full=True: U, Sigma, V, a-posteriori error estimate for the reconstruction error ||A-U Sigma V^T ||_F / ||A||_F (computed according to [2] along the "true" merging tree).
+        if full=False: U, a-posteriori error estimate
+
+    References
+    -------
+    [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
+    [2] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
+    """
+    if A.comm.rank == 0:
+        print(
+            "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed reltol is only efficient when the rank to reach this accuracy is rather small compared to the overal matrix size. In other cases, either memory issues or loss of desired precision may occure."
+        )
+    A_local_size = max(A.lshape_map[:, 1])
+
+    if maxmergedim is not None and maxrank is None:
+        maxrank = floor(A_local_size / 2) - safetyshift
+        if maxrank <= 0:
+            raise RuntimeError("maxmergedim is too small or safetyshift is too large.")
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing maxmergedim is recommended to avoid memory issues, but may result in loss of desired precision (reltol). If this occures, a separate warning will be raised."
+            )
+
+    if maxmergedim is None and maxrank is not None:
+        if A_local_size >= 2 * (maxrank + safetyshift):
+            maxmergedim = A_local_size
+        else:
+            maxmergedim = 2 * (maxrank + safetyshift) + 1
+            if A.comm.rank == 0:
+                print(
+                    "Warning: Given maxrank (or saftyshift) is so large that arrays of size larger than A.larray have to be dealt with on a single process. This may cause memory issues."
+                )
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing maxrank is recommended to avoid memory issues, but may result in loss of desired precision (reltol). If this occures, a separate warning will be raised."
+            )
+
+    if (
+        maxmergedim is not None
+        and maxrank is not None
+        and maxmergedim < 2 * (maxrank + safetyshift) + 1
+    ):
+        raise RuntimeError(
+            "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
+            % (maxrank, maxmergedim)
+        )
+
+    if maxmergedim is None and maxrank is None:
+        if no_of_merges is None:
+            no_of_merges = 2
+        maxmergedim = A.shape[1]
+        maxrank = A.shape[1]
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing only reltol and the number of processes to be merged in each step (without specifying maxrank or maxmergedim) may result in memory issues."
+            )
+
+    if no_of_merges is not None and no_of_merges < 2:
+        raise RuntimeError(
+            "It is required that no_of_merges >= 2. Please consider omitting this argument in order to use the default value."
+        )
+
+    return hsvd(
+        A,
+        maxrank=maxrank,
+        maxmergedim=maxmergedim,
+        reltol=reltol,
+        safetyshift=safetyshift,
+        no_of_merges=no_of_merges,
+        full=full,
+        silent=silent,
+        warnings_off=True,
+    )
+
+
+def hpod_rank(
+    A: DNDarray,
+    maxrank: int,
+    weight_matrix: Union[torch.Tensor, None] = None,
+    maxmergedim: Union[int, None] = None,
+    safetyshift: int = 5,
+    full: bool = False,
+    silent: bool = True,
+) -> Tuple[DNDarray, float]:
+    """
+    Hierarchical POD (hPOD) with prescribed truncation rank maxrank.
+    See the description of hsvd_rank for more details...
+
+    References
+    -------
+    [1] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
+    """
+    if A.comm.rank == 0:
+        print(
+            "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed trunction rank maxrank only yields accurate results when the underlying matrix is of low-rank structure with rank at most maxrank."
+        )
+    A_local_size = max(A.lshape_map[:, 1])
+
+    if maxmergedim is not None and maxmergedim < 2 * (maxrank + safetyshift) + 1:
+        if A.comm.rank == 0:
+            raise RuntimeError(
+                "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
+                % (maxrank, maxmergedim)
+            )
+
+    if maxmergedim is None:
+        if A_local_size >= 2 * (maxrank + safetyshift):
+            maxmergedim = A_local_size
+        else:
+            maxmergedim = 2 * (maxrank + safetyshift) + 1
+            if A.comm.rank == 0:
+                print(
+                    "Warning: Given maxrank (or saftyshift) is so large that arrays of size larger than A.larray have to be dealt with on a single process. This may cause memory issues."
+                )
+
+    return hpod(
+        A,
+        weight_matrix=weight_matrix,
+        maxrank=maxrank,
+        maxmergedim=maxmergedim,
+        reltol=None,
+        no_of_merges=None,
+        silent=silent,
+        warnings_off=True,
+    )
+
+
+def hpod_reltol(
+    A: DNDarray,
+    reltol: float,
+    weight_matrix: Union[torch.Tensor, None] = None,
+    maxrank: Union[int, None] = None,
+    maxmergedim: Union[int, None] = None,
+    safetyshift: int = 5,
+    no_of_merges: Union[int, None] = None,
+    full: bool = False,
+    silent: bool = True,
+) -> Tuple[DNDarray, float]:
+    """
+    Hierchical SVD (hSVD) with prescribed upper bound on the relative reconstruction error.
+    See the description of hsvd_reltol for more details...
+
+    References
+    -------
+    [1] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
+    """
+    if A.comm.rank == 0:
+        print(
+            "INFO: Please be aware of the fact that hiearchical POD (hPOD) with prescribed reltol is only efficient when the rank to reach this accuracy is rather small compared to the overal matrix size. In other cases, either memory issues or loss of desired precision may occure."
+        )
+    A_local_size = max(A.lshape_map[:, 1])
+
+    if maxmergedim is not None and maxrank is None:
+        maxrank = floor(A_local_size / 2) - safetyshift
+        if maxrank <= 0:
+            raise RuntimeError("maxmergedim is too small or safetyshift is too large.")
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing maxmergedim is recommended to avoid memory issues, but may result in loss of desired precision (reltol). If this occures, a separate warning will be raised."
+            )
+
+    if maxmergedim is None and maxrank is not None:
+        if A_local_size >= 2 * (maxrank + safetyshift):
+            maxmergedim = A_local_size
+        else:
+            maxmergedim = 2 * (maxrank + safetyshift) + 1
+            if A.comm.rank == 0:
+                print(
+                    "Warning: Given maxrank (or saftyshift) is so large that arrays of size larger than A.larray have to be dealt with on a single process. This may cause memory issues."
+                )
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing maxrank is recommended to avoid memory issues, but may result in loss of desired precision (reltol). If this occures, a separate warning will be raised."
+            )
+
+    if (
+        maxmergedim is not None
+        and maxrank is not None
+        and maxmergedim < 2 * (maxrank + safetyshift) + 1
+    ):
+        raise RuntimeError(
+            "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
+            % (maxrank, maxmergedim)
+        )
+
+    if maxmergedim is None and maxrank is None:
+        if no_of_merges is None:
+            no_of_merges = 2
+        maxmergedim = A.shape[1]
+        maxrank = A.shape[1]
+        if A.comm.rank == 0:
+            print(
+                "Warning: Prescribing only reltol and the number of processes to be merged in each step (without specifying maxrank or maxmergedim) may result in memory issues."
+            )
+
+    if no_of_merges is not None and no_of_merges < 2:
+        raise RuntimeError(
+            "It is required that no_of_merges >= 2. Please consider omitting this argument in order to use the default value."
+        )
+
+    return hpod(
+        A,
+        weight_matrix=weight_matrix,
+        maxrank=maxrank,
+        maxmergedim=maxmergedim,
+        reltol=reltol,
+        no_of_merges=no_of_merges,
+        silent=silent,
+        warnings_off=True,
+    )
+
+
+################################################################################################
+# hSVD and hPOD - "full" Routines for the experts
+################################################################################################
 
 
 def hsvd(
@@ -32,6 +402,7 @@ def hsvd(
     no_of_merges: Union[int, None] = None,
     full: bool = False,
     silent: bool = True,
+    warnings_off: bool = False,
 ) -> Union[
     Tuple[DNDarray, DNDarray, DNDarray, float], Tuple[DNDarray, DNDarray, DNDarray], DNDarray
 ]:
@@ -57,12 +428,10 @@ def hsvd(
     [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
     [2] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
-    if A.comm.rank == 0:
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-        print("WARNING: hierarchical SVD is intended for highly thin and/or low-")
-        print("rank DNDarrays with split=1.")
-        print("In other cases the result may be highly inaccurate!")
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    if not warnings_off and A.comm.rank == 0:
+        print(
+            "Warning: You are using the 'expert variant' of hierarchical SVD with the maximum number of parameters to choose. Please consider using the variants hsvd_rank or hsvd_reltol with less parameters and appropriate default choices instead if you are not familar to the algorithmic details."
+        )
 
     if not isinstance(A, DNDarray):
         raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
@@ -81,8 +450,6 @@ def hsvd(
         transposeflag = True
         A = A.T
 
-    # Choice of the parameters
-    # A_local_size = max(A.lshape_map[:, 1])
     no_procs = A.comm.Get_size()
 
     Anorm = vector_norm(A)
@@ -96,36 +463,16 @@ def hsvd(
     level = 0
     active_nodes = [i for i in range(no_procs)]
     if A.comm.rank == 0 and not silent:
-        print("hSVD level %d..." % level, active_nodes)
-
-    # U_loc, sigma_loc, _ = torch.linalg.svd(A.larray, full_matrices=False)
-    # if reltol is None:
-    #     loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
-    # else:
-    #     ideal_trunc_rank = min(
-    #         torch.argwhere(
-    #             torch.tensor(
-    #                 [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
-    #             )
-    #             < loctol**2
-    #         )
-    #     )
-    #     loc_trunc_rank = min(maxrank, ideal_trunc_rank)
-    #     if loc_trunc_rank != ideal_trunc_rank:
-    #         print(
-    #             "Warning (level %d, process %d): reltol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
-    #             % (level, A.comm.rank, reltol, ideal_trunc_rank, maxrank)
-    #         )
-    # U_loc = torch.linalg.matmul(U_loc[:, :loc_trunc_rank], torch.diag(sigma_loc[:loc_trunc_rank]))
-    # err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
+        print(
+            "hSVD level %d...\t" % level,
+            "processes ",
+            "\t\t".join(["%d" % an for an in active_nodes]),
+        )
 
     U_loc, sigma_loc, err_squared_loc = compute_local_truncated_svd(
         level, A.comm.rank, A.larray, maxrank, loctol, safetyshift
     )
     U_loc = torch.linalg.matmul(U_loc, torch.diag(sigma_loc))
-
-    # if not silent:
-    #    graph = np.ones(no_procs)
 
     finished = False
     while not finished:
@@ -134,6 +481,12 @@ def hsvd(
         dims_global[A.comm.rank] = U_loc.shape[1]
         for k in range(no_procs):
             dims_global[k] = A.comm.bcast(dims_global[k], root=k)
+
+        if A.comm.rank == 0 and not silent:
+            print(
+                "              current ranks:",
+                "\t\t".join(["%d" % dims_global[an] for an in active_nodes]),
+            )
 
         # determine future nodes and prepare sending
         future_nodes = [0]
@@ -161,10 +514,6 @@ def hsvd(
         for i in future_nodes:
             recv_from[i] = [k for k in range(no_procs) if send_to[k] == i]
 
-        # if not silent:
-        #    graph = np.vstack([graph,
-        #                       np.asarray([1 if i in future_nodes else 0 for i in range(no_procs)])])
-
         if A.comm.rank in future_nodes:
             # FUTURE NODES
             # in the future nodes receive local arrays from previous level
@@ -189,7 +538,11 @@ def hsvd(
             err_squared_loc = sum(err_squared_loc)
             level += 1
             if A.comm.rank == 0 and not silent:
-                print("hSVD level %d..." % level, "reduce to nodes", future_nodes)
+                print(
+                    "hSVD level %d...\t" % level,
+                    "processes ",
+                    "\t\t".join(["%d" % fn for fn in future_nodes]),
+                )
             # compute "local" SVDs on the current level
 
             if len(future_nodes) == 1:
@@ -197,25 +550,6 @@ def hsvd(
             U_loc, sigma_loc, err_squared_loc_new = compute_local_truncated_svd(
                 level, A.comm.rank, U_loc, maxrank, loctol, safetyshift
             )
-
-            # U_loc, sigma_loc, _ = torch.linalg.svd(U_loc, full_matrices=False)
-            # if reltol is None:
-            #     loc_trunc_rank = min(sigma_loc.shape[0], maxrank)
-            # else:
-            #     ideal_trunc_rank = min(
-            #         torch.argwhere(
-            #             torch.tensor(
-            #                 [torch.norm(sigma_loc[k:]) ** 2 for k in range(sigma_loc.shape[0] + 1)]
-            #             )
-            #             < loctol**2
-            #         )
-            #     )
-            #     loc_trunc_rank = min(maxrank, ideal_trunc_rank)
-            #     if loc_trunc_rank != ideal_trunc_rank:
-            #         print(
-            #             "Warning (level %d, process %d): reltol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
-            #             % (level, A.comm.rank, reltol, ideal_trunc_rank, maxrank)
-            #         )
 
             if len(future_nodes) > 1:
                 # prepare next level or...
@@ -247,9 +581,6 @@ def hsvd(
         factories.array(err_squared_loc**0.5, device=A.device, split=None, comm=A.comm) / Anorm
     )
 
-    # if not silent:
-    #    np.savetxt('hsvd_graph.txt',graph)
-
     # Postprocessing:
     # compute V if required or if split=0 for the input
     # in case of split=0 undo the transposition...
@@ -274,19 +605,23 @@ def hpod(
     weight_matrix: Union[torch.Tensor, None] = None,
     maxrank: Union[int, None] = None,
     maxmergedim: Union[int, None] = None,
+    reltol: Union[float, None] = None,
+    no_of_merges: Union[int, None] = None,
     silent: bool = True,
+    warnings_off: bool = False,
 ) -> Tuple[DNDarray, float]:
     """
-    Computes the POD of rank r=maxrank for the snapshot set given by the column vectors of A.
-    The weight matrix for the scalar product is given by weight_matrix.
-
-    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    Prelimiary and experimental!
-    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    Hierachical POD (hPOD)
+    See description of hsvd for more details...
 
     Selected References:
     [1] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
+    if not warnings_off and A.comm.rank == 0:
+        print(
+            "Warning: You are using the 'expert variant' of hierarchical POD with the maximum number of parameters to choose. Please consider using the variants hsvd_rank or hsvd_reltol with less parameters and appropriate default choices instead if you are not familar to the algorithmic details."
+        )
+
     if not isinstance(A, DNDarray):
         raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
     if not A.ndim == 2:
@@ -297,6 +632,7 @@ def hpod(
                 A.dtype
             )
         )
+
     if weight_matrix is not None and weight_matrix.dtype != A.dtype.torch_type():
         raise RuntimeError(
             "Data types of input A and input weight_matrix need to coicide, but are {} and {}.".format(
@@ -309,33 +645,29 @@ def hpod(
             "Argument A needs to have split dimension 1. Consider, e.g., calling A.resplit_(1) before using hpod."
         )
 
-    # if maxrank = 0 we choose a default value for maxrank
-    # the chosen default value corresponds to merging along a binary tree (i.e. maxrank = local size / 2)
-    if maxrank is None:
-        maxrank = floor(max(A.lshape_map[:, 1]) / 2)
-    if maxmergedim is None:
-        maxmergedim = max(A.lshape_map[:, 1])
-    # if the manually set maxrank is so large that with either the default or the manually set maxmergedim it would not be possible to merge (even along a binary tree), we increase maxmergedim and warn the user
-    if 2 * maxrank > maxmergedim:
-        maxmergedim = 2 * maxrank + 1
-        if A.comm.rank == 0:
-            print("WARNING: maxmergedim = 2*truncationrank +1 might cause memory issues!")
-
     no_procs = A.comm.Get_size()
+
+    Anorm = vector_norm_weighted(A, weight_matrix)
+
+    if reltol is not None:
+        loctol = Anorm.larray * reltol / sqrt(2 * no_procs - 1)
+    else:
+        loctol = None
 
     # compute the SVDs on the 0th level
     level = 0
     active_nodes = [i for i in range(no_procs)]
     if A.comm.rank == 0 and not silent:
-        print("hPOD level %d..." % level, active_nodes)
+        print(
+            "hPOD level %d...\t" % level,
+            "processes ",
+            "\t\t".join(["%d" % an for an in active_nodes]),
+        )
 
     U_loc, sigma_loc, err_squared_loc = compute_local_pod(
-        level, A.comm.rank, A.larray, maxrank, None, weight_matrix
+        level, A.comm.rank, A.larray, maxrank, loctol, weight_matrix
     )
     U_loc = torch.linalg.matmul(U_loc, torch.diag(sigma_loc))
-
-    # if not silent:
-    #    graph = np.ones(no_procs)
 
     finished = False
     while not finished:
@@ -345,6 +677,12 @@ def hpod(
         for k in range(no_procs):
             dims_global[k] = A.comm.bcast(dims_global[k], root=k)
 
+        if A.comm.rank == 0 and not silent:
+            print(
+                "              current ranks:",
+                "\t\t".join(["%d" % dims_global[an] for an in active_nodes]),
+            )
+
         # determine future nodes and prepare sending
         future_nodes = [0]
         send_to = [[]] * no_procs
@@ -352,25 +690,24 @@ def hpod(
         current_future_node = 0
         used_budget = 0
         k = 0
+        counter = 0
         while k < len(active_nodes):
             current_idx = active_nodes[k]
-            if used_budget + dims_global[current_idx] > maxmergedim:
+            if used_budget + dims_global[current_idx] > maxmergedim or counter == no_of_merges:
                 current_future_node = current_idx
                 future_nodes.append(current_future_node)
                 used_budget = dims_global[current_idx]
+                counter = 1
             else:
                 if not used_budget == 0:
                     send_to[current_idx] = current_future_node
                 used_budget += dims_global[current_idx]
+                counter += 1
             k += 1
 
         recv_from = [[]] * no_procs
         for i in future_nodes:
             recv_from[i] = [k for k in range(no_procs) if send_to[k] == i]
-
-        # if not silent:
-        #    graph = np.vstack([graph,
-        #                       np.asarray([1 if i in future_nodes else 0 for i in range(no_procs)])])
 
         if A.comm.rank in future_nodes:
             # FUTURE NODES
@@ -396,11 +733,15 @@ def hpod(
             err_squared_loc = sum(err_squared_loc)
             level += 1
             if A.comm.rank == 0 and not silent:
-                print("hPOD level %d..." % level, "reduce to nodes", future_nodes)
+                print(
+                    "hPOD level %d...\t" % level,
+                    "processes ",
+                    "\t\t".join(["%d" % fn for fn in future_nodes]),
+                )
             # compute "local" SVDs on the current level
 
             U_loc, sigma_loc, err_squared_loc_new = compute_local_pod(
-                level, A.comm.rank, U_loc, maxrank, None, weight_matrix
+                level, A.comm.rank, U_loc, maxrank, loctol, weight_matrix
             )
 
             if len(future_nodes) > 1:
@@ -429,14 +770,16 @@ def hpod(
 
     U = factories.array(U_loc, device=A.device, split=None, comm=A.comm)
 
-    mean_sq_error_estimate = (
-        factories.array(err_squared_loc, device=A.device, split=None, comm=A.comm) / A.shape[1]
+    rel_error_estimate = (
+        factories.array(err_squared_loc**0.5, device=A.device, split=None, comm=A.comm) / Anorm
     )
 
-    # if not silent:
-    #    np.savetxt('hsvd_graph.txt',graph)
+    return U, rel_error_estimate
 
-    return U, mean_sq_error_estimate
+
+##############################################################################################
+# AUXILIARY ROUTINES
+##############################################################################################
 
 
 def compute_local_truncated_svd(
@@ -474,7 +817,7 @@ def compute_local_truncated_svd(
         loc_trunc_rank = min(maxrank, ideal_trunc_rank, cut_noise_rank)
         if loc_trunc_rank != ideal_trunc_rank:
             print(
-                "Warning (level %d, process %d): abs tol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
+                "in hSVD (level %d, process %d): abs tol = %2.2e requires truncation to rank %d, but maxrank=%d. Loss of desired precision (reltol) very likely!"
                 % (level, proc_id, loctol, ideal_trunc_rank, maxrank)
             )
 
@@ -512,7 +855,7 @@ def compute_local_pod(
             loc_trunc_rank = min(maxrank, ideal_trunc_rank)
             if loc_trunc_rank != ideal_trunc_rank:
                 print(
-                    "Warning (level %d, process %d): abs tol = %2.2e requires truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
+                    "in hPOD (level %d, process %d): abs tol = %2.2e requires truncation to rank %d, but maxrank=%d. Loss of desired precision (reltol) very likely!"
                     % (level, proc_id, loctol, ideal_trunc_rank, maxrank)
                 )
         err_squared_loc = torch.linalg.norm(sigma_loc[loc_trunc_rank:]) ** 2
@@ -536,30 +879,23 @@ def compute_local_pod(
         if loctol is None:
             ideal_trunc_rank = maxrank
         else:
-            # ideal_trunc_rank = min(
-            #     torch.argwhere(
-            #         torch.tensor(
-            #             [sum(lamda[:k]) for k in range(lamda.shape[0] + 1)]
-            #         )
-            #         > gramian_trace - loctol**2
-            #     )
-            # )
             ideal_trunc_rank = min(
                 torch.argwhere(
                     torch.tensor(
-                        [torch.sum(lamda[k:]) for k in range(lamda.shape[0])], device=U_loc.device
+                        [torch.sum(lamda[k:]) for k in range(lamda.shape[0] + 1)],
+                        device=U_loc.device,
                     )
                     < loctol**2
                 )
             )
             if ideal_trunc_rank > maxrank:
                 print(
-                    "Warning (level %d, process %d): desired abs tol = %2.2e would require truncation to rank %d, but maxrank=%d. Possible loss of desired precision."
+                    "in hPOD (level %d, process %d): desired abs tol = %2.2e would require truncation to rank %d, but maxrank=%d. Loss of desired precision is likely."
                     % (level, proc_id, loctol, ideal_trunc_rank, maxrank)
                 )
         if ideal_trunc_rank > cut_noise_rank:
             print(
-                "Warning (level %d, process %d): truncation to rank %d is intended, but numerical noise of eigh starts after rank %d. Possible loss of desired precision."
+                "in hPOD (level %d, process %d): truncation to rank %d is intended, but numerical noise of eigh starts after rank %d. Loss of desired precision is likely."
                 % (level, proc_id, ideal_trunc_rank, cut_noise_rank)
             )
         loc_trunc_rank = min(maxrank, cut_noise_rank, ideal_trunc_rank)
@@ -567,3 +903,19 @@ def compute_local_pod(
         sigma = lamda[:loc_trunc_rank] ** 0.5
         U = U_loc @ V[:, :loc_trunc_rank] @ torch.diag(1.0 / sigma)
         return U, sigma, err_squared_loc
+
+
+def vector_norm_weighted(A: DNDarray, weight: Union[torch.Tensor, None]) -> DNDarray:
+    """
+    Auxiliary routine: computes the sum of the norms of the columns of A where the norms
+    of the columns are given by the weightmatrix weight.
+    """
+    if weight is None:
+        return vector_norm(A)
+    else:
+        snd_buf = torch.trace((A.larray).T @ weight @ A.larray)
+        result = A.comm.allreduce(snd_buf)
+        result = factories.array(
+            result**0.5, dtype=A.dtype, split=None, device=A.device, comm=A.comm
+        )
+        return result
