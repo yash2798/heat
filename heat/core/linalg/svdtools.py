@@ -82,6 +82,16 @@ def hsvd_rank(
     [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
     [2] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
+    if not isinstance(A, DNDarray):
+        raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
+    if not A.ndim == 2:
+        raise RuntimeError("A needs to be a 2D matrix")
+    if not A.dtype == types.float32 and not A.dtype == types.float64:
+        raise RuntimeError(
+            "Argument needs to be a DNDarray with datatype float32 or float64, but data type is {}.".format(
+                A.dtype
+            )
+        )
     if A.comm.rank == 0:
         print(
             "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed trunction rank maxrank only yields accurate results when the underlying matrix is of low-rank structure with rank at most maxrank."
@@ -89,11 +99,10 @@ def hsvd_rank(
     A_local_size = max(A.lshape_map[:, 1])
 
     if maxmergedim is not None and maxmergedim < 2 * (maxrank + safetyshift) + 1:
-        if A.comm.rank == 0:
-            raise RuntimeError(
-                "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
-                % (maxrank, maxmergedim)
-            )
+        raise RuntimeError(
+            "Given maxrank=%d, the choice maxmergedim=%d is too small. Please ensure maxmergedim > 2*(maxrank + safetyshift) or do not specify maxmergedim in order to work with the default value."
+            % (maxrank, maxmergedim)
+        )
 
     if maxmergedim is None:
         if A_local_size >= 2 * (maxrank + safetyshift):
@@ -184,6 +193,16 @@ def hsvd_reltol(
     [1] Iwen, Ong. A distributed and incremental SVD algorithm for agglomerative data analysis on large networks. SIAM J. Matrix Anal. Appl., 37(4), 2016.
     [2] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
+    if not isinstance(A, DNDarray):
+        raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
+    if not A.ndim == 2:
+        raise RuntimeError("A needs to be a 2D matrix")
+    if not A.dtype == types.float32 and not A.dtype == types.float64:
+        raise RuntimeError(
+            "Argument needs to be a DNDarray with datatype float32 or float64, but data type is {}.".format(
+                A.dtype
+            )
+        )
     if A.comm.rank == 0:
         print(
             "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed reltol is only efficient when the rank to reach this accuracy is rather small compared to the overal matrix size. In other cases, either memory issues or loss of desired precision may occure."
@@ -226,7 +245,7 @@ def hsvd_reltol(
     if maxmergedim is None and maxrank is None:
         if no_of_merges is None:
             no_of_merges = 2
-        maxmergedim = A.shape[1]
+        maxmergedim = 2 * (A.shape[1] + safetyshift) + 1
         maxrank = A.shape[1]
         if A.comm.rank == 0:
             print(
@@ -268,6 +287,16 @@ def hpod_rank(
     -------
     [1] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
+    if not isinstance(A, DNDarray):
+        raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
+    if not A.ndim == 2:
+        raise RuntimeError("A needs to be a 2D matrix")
+    if not A.dtype == types.float32 and not A.dtype == types.float64:
+        raise RuntimeError(
+            "Argument needs to be a DNDarray with datatype float32 or float64, but data type is {}.".format(
+                A.dtype
+            )
+        )
     if A.comm.rank == 0:
         print(
             "INFO: Please be aware of the fact that hiearchical SVD (hSVD) with prescribed trunction rank maxrank only yields accurate results when the underlying matrix is of low-rank structure with rank at most maxrank."
@@ -322,6 +351,16 @@ def hpod_reltol(
     -------
     [1] Himpe, Leibner, Rave. Hierarchical approximate proper orthogonal decomposition. SIAM J. Sci. Comput., 40 (5), 2018.
     """
+    if not isinstance(A, DNDarray):
+        raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
+    if not A.ndim == 2:
+        raise RuntimeError("A needs to be a 2D matrix")
+    if not A.dtype == types.float32 and not A.dtype == types.float64:
+        raise RuntimeError(
+            "Argument needs to be a DNDarray with datatype float32 or float64, but data type is {}.".format(
+                A.dtype
+            )
+        )
     if A.comm.rank == 0:
         print(
             "INFO: Please be aware of the fact that hiearchical POD (hPOD) with prescribed reltol is only efficient when the rank to reach this accuracy is rather small compared to the overal matrix size. In other cases, either memory issues or loss of desired precision may occure."
@@ -431,17 +470,6 @@ def hsvd(
     if not warnings_off and A.comm.rank == 0:
         print(
             "Warning: You are using the 'expert variant' of hierarchical SVD with the maximum number of parameters to choose. Please consider using the variants hsvd_rank or hsvd_reltol with less parameters and appropriate default choices instead if you are not familar to the algorithmic details."
-        )
-
-    if not isinstance(A, DNDarray):
-        raise RuntimeError("Argument needs to be a DNDarray but is {}.".format(type(A)))
-    if not A.ndim == 2:
-        raise RuntimeError("A needs to be a 2D matrix")
-    if not A.dtype == types.float32 and not A.dtype == types.float64:
-        raise RuntimeError(
-            "Argument needs to be a DNDarray with datatype float32 or float64, but data type is {}.".format(
-                A.dtype
-            )
         )
 
     # if split dimension is 0, transpose matrix and remember this
